@@ -14,7 +14,7 @@ use std::sync::OnceLock;
 static ORIGINAL_USER: OnceLock<String> = OnceLock::new();
 static USER_DIRECTORY: OnceLock<String> = OnceLock::new();
 const SYSTEM_DIRECTORY: &str = "/var/lib/novarch";
-const SYSTEM_FILE: &str = "/var/lib/novarch/test.yaml";
+const SYSTEM_FILE: &str = "/var/lib/novarch/system.yaml";
 
 fn get_original_user() -> Result<(), String> {
     let user = env::var("SUDO_USER").map_err(|_| "Program must be run with sudo".to_string())?;
@@ -66,13 +66,32 @@ fn setup_check() {
     if Path::new(SYSTEM_FILE).exists() {
         let file = File::open(SYSTEM_FILE).expect("Failed to read systemfile");
         let reader = BufReader::new(file);
-        let config: Config = serde_yaml_ng::from_reader(reader).expect("Failed to read systemfile");
+        let mut config: Config = serde_yaml_ng::from_reader(reader).expect("Failed to read systemfile");
 
-        if Path::new(&config.folder).is_dir() {
-            println!("")
-        } else {
-            eprintln!("Folder {} does not exist", config.folder)
+        println!("Enter path for packages folder: ");
+        let mut input = String::new();
+        io::stdin()
+            .read_line(&mut input)
+            .expect("Failed to read input");
+        let trimed_input = input.trim();
+        let folder = match (trimed_input.starts_with("~"), ORIGINAL_USER.get()) {
+            (true, Some(user)) => {
+                format!("/home/{}{}", user, &trimed_input[1..])
+            }
+            (true, None) => {
+                eprintln!("Script is not ran as sudo");
+                trimed_input.to_string()
+            }
+            (false, _) => trimed_input.to_string(),
+        };
+        if Path::new(&folder).is_dir() {
+            config.folder = folder;
+            if let Err(e) = save_systemfile(&config) {
+                eprintln!("Error saving systemfile {}", e)
+            }
         }
+
+
     } else {
         println!("System file does not exists starting fresh...");
         println!("Enter path for packages folder: ");
