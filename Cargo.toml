@@ -1,0 +1,16 @@
+[package]
+name = "manager"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml_ng = "0.10.0"
+alpm = "4.0.3"
+clap = { version = "4", features = ["derive"] }
+
+[profile.release]
+opt-level = 'z'     # Optimize for size (like Python's -O flag)
+lto = true          # Link-time optimization
+codegen-units = 1   # Maximum optimization
+strip = true        # Remove debug symbols
