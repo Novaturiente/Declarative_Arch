@@ -10,6 +10,15 @@ use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
 use std::process::{exit, Command, Stdio};
 use std::sync::OnceLock;
+use const_format::concatcp;
+
+// ANSI color codes
+const RESET: &str = "\x1b[0m";
+
+const RED_CROSS: &str = concatcp!("\x1b[91m", "✗", RESET);
+const YELLOW_WARNING: &str = concatcp!("\x1b[93m", "⚠", RESET);
+const BLUE_GEAR: &str = concatcp!("\x1b[94m", "⚙", RESET);
+const GREEN_CHECK: &str = concatcp!("\x1b[92m", "✓", RESET);
 
 static ORIGINAL_USER: OnceLock<String> = OnceLock::new();
 static USER_DIRECTORY: OnceLock<String> = OnceLock::new();
@@ -39,11 +48,11 @@ fn run_command(command: &str) {
     match result {
         Ok(status) => {
             if !status.success() {
-                eprintln!("Command failed with exit code: {:?}", status.code());
+                eprintln!("{} Command failed with exit code: {:?}", RED_CROSS, status.code());
             }
         }
         Err(e) => {
-            eprintln!("Failed to execute command: {}", e);
+            eprintln!("{} Failed to execute command: {}", RED_CROSS, e);
         }
     }
 }
@@ -87,13 +96,13 @@ fn setup_check() {
         if Path::new(&folder).is_dir() {
             config.folder = folder;
             if let Err(e) = save_systemfile(&config) {
-                eprintln!("Error saving systemfile {}", e)
+                eprintln!("{} Error saving systemfile {}", RED_CROSS, e)
             }
         }
 
 
     } else {
-        println!("System file does not exists starting fresh...");
+        println!("{} System file does not exists starting fresh...", YELLOW_WARNING);
         println!("Enter path for packages folder: ");
         let mut input = String::new();
         io::stdin()
@@ -117,7 +126,7 @@ fn setup_check() {
         if Path::new(&folder).is_dir() {
             new_config.folder = folder;
             if let Err(e) = save_systemfile(&new_config) {
-                eprintln!("Error saving systemfile {}", e)
+                eprintln!("{} Error saving systemfile {}",RED_CROSS, e)
             }
         }
     }
@@ -130,11 +139,11 @@ fn update_system() {
         .expect("Failed to check for reflector");
 
     if !output.status.success() {
-        println!("Reflector not installed installing now");
+        println!("{} Reflector not installed installing now", YELLOW_WARNING);
         run_command("pacman -S --noconfirm reflector");
     }
     run_command(
-        "reflector --latest 10 --protocol https --sort rate --save /etc/pacman.d/mirrorlist",
+        "reflector --latest 10 --protocol https --sort rate --save /etc/pacman.d/mirrorlist 2>/dev/null",
     );
     run_command("paru -Syu --noconfirm");
 }
@@ -166,7 +175,8 @@ fn chaotic_aur_setup() {
         Err(_) => false,
     };
     if !chaotic_enabled {
-        update_system();
+        println!("Configuring Chaotic-AUR");
+        run_command("pacman -Syu");
         run_command("pacman-key --init");
         run_command("pacman -Sy --noconfirm archlinux-keyring");
         run_command("pacman-key --recv-key 3056513887B78AEB --keyserver keyserver.ubuntu.com");
@@ -185,6 +195,7 @@ fn chaotic_aur_setup() {
 
         writeln!(file, "[chaotic-aur]").expect("Failed to write");
         writeln!(file, "Include = /etc/pacman.d/chaotic-mirrorlist").expect("Failed to write");
+        println!("{} Chaotic-AUR added", GREEN_CHECK);
         run_command("pacman -Syu --noconfirm");
     }
 }
@@ -233,7 +244,7 @@ fn install_packages() {
             existing_packages = existing;
         }
         Err(e) => {
-            eprintln!("Error reading packages :: {}", e);
+            eprintln!("{} Error reading packages :: {}", RED_CROSS, e);
             return; // Exit early on error
         }
     }
@@ -268,6 +279,7 @@ fn install_packages() {
                 match result {
                     Ok(status) => {
                         if status.success() {
+                            println!("{} All packages installed", GREEN_CHECK);
                             let file = File::open(SYSTEM_FILE).expect("Failed to read systemfile");
                             let reader = BufReader::new(file);
                             let mut config: Config = serde_yaml_ng::from_reader(reader)
@@ -292,9 +304,9 @@ fn install_packages() {
                         }
                     }
                     Err(e) => {
-                        eprintln!("Failed to execute command: {} (attempt {})", e, attempts);
+                        eprintln!("{} Failed to execute command: {} (attempt {})",YELLOW_WARNING, e, attempts);
                         if attempts >= max_attempts {
-                            eprintln!("Command execution failed after {} attempts", max_attempts);
+                            eprintln!("{} Command execution failed after {} attempts",RED_CROSS, max_attempts);
                             break;
                         }
                     }
@@ -302,7 +314,7 @@ fn install_packages() {
             }
         }
     } else {
-        println!("No package to install");
+        println!("{} No package to install", GREEN_CHECK);
     }
 }
 
@@ -368,7 +380,7 @@ fn remove_packages() {
             Err(_) => eprintln!("Failed to save systemfile"),
         }
     } else {
-        println!("No package to remove");
+        println!("{} No package to remove", GREEN_CHECK);
     }
 }
 
@@ -379,7 +391,7 @@ fn manage_package() {
         .expect("Failed to check for reflector");
 
     if !output.status.success() {
-        println!("Paru not installed installing now");
+        println!("{} Paru not installed installing now", YELLOW_WARNING);
         run_command("pacman -S --noconfirm paru");
     }
     install_packages();
@@ -394,7 +406,6 @@ fn initialize() {
 }
 
 fn update() {
-    setup_check();
     update_system();
     manage_package();
 
@@ -445,7 +456,7 @@ fn main() {
     match get_original_user() {
         Ok(_user) => {}
         Err(e) => {
-            eprintln!("Error: {}", e);
+            eprintln!("{} Error: {}",RED_CROSS, e);
             exit(1);
         }
     }
@@ -453,19 +464,19 @@ fn main() {
     let cli = Cli::parse();
     match &cli.command {
         Commands::Init => {
-            println!("Initializing...");
+            println!("{} Initializing...", BLUE_GEAR);
             initialize();
         }
         Commands::Install => {
-            println!("Installing...");
+            println!("{} Installing...", BLUE_GEAR);
             manage_package();
         }
         Commands::Update => {
-            println!("Updating...");
+            println!("{} Updating...", BLUE_GEAR);
             update();
         }
         Commands::Info => {
-            println!("Showing info...");
+            println!("{} Showing info...", BLUE_GEAR);
             info();
         }
     }
