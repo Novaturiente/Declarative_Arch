@@ -1,16 +1,22 @@
 use alpm::Alpm;
 use alpm::PackageReason;
-use serde::{Deserialize, Serialize};
 use clap::{Parser, Subcommand};
+use const_format::concatcp;
+use serde::{Deserialize, Serialize};
 use std::env;
 use std::fs;
 use std::fs::File;
 use std::fs::OpenOptions;
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
-use std::process::{exit, Command, Stdio};
+use std::path::PathBuf;
+use std::process::{Command, Stdio, exit};
 use std::sync::OnceLock;
-use const_format::concatcp;
+
+static ORIGINAL_USER: OnceLock<String> = OnceLock::new();
+static USER_DIRECTORY: OnceLock<String> = OnceLock::new();
+const SYSTEM_DIRECTORY: &str = "/var/lib/novarch";
+const SYSTEM_FILE: &str = "/var/lib/novarch/system.yaml";
 
 // ANSI color codes
 const RESET: &str = "\x1b[0m";
@@ -19,11 +25,6 @@ const RED_CROSS: &str = concatcp!("\x1b[91m", "✗", RESET);
 const YELLOW_WARNING: &str = concatcp!("\x1b[93m", "⚠", RESET);
 const BLUE_GEAR: &str = concatcp!("\x1b[94m", "⚙", RESET);
 const GREEN_CHECK: &str = concatcp!("\x1b[92m", "✓", RESET);
-
-static ORIGINAL_USER: OnceLock<String> = OnceLock::new();
-static USER_DIRECTORY: OnceLock<String> = OnceLock::new();
-const SYSTEM_DIRECTORY: &str = "/var/lib/novarch";
-const SYSTEM_FILE: &str = "/var/lib/novarch/system.yaml";
 
 fn get_original_user() -> Result<(), String> {
     let user = env::var("SUDO_USER").map_err(|_| "Program must be run with sudo".to_string())?;
@@ -48,7 +49,11 @@ fn run_command(command: &str) {
     match result {
         Ok(status) => {
             if !status.success() {
-                eprintln!("{} Command failed with exit code: {:?}", RED_CROSS, status.code());
+                eprintln!(
+                    "{} Command failed with exit code: {:?}",
+                    RED_CROSS,
+                    status.code()
+                );
             }
         }
         Err(e) => {
@@ -75,7 +80,8 @@ fn setup_check() {
     if Path::new(SYSTEM_FILE).exists() {
         let file = File::open(SYSTEM_FILE).expect("Failed to read systemfile");
         let reader = BufReader::new(file);
-        let mut config: Config = serde_yaml_ng::from_reader(reader).expect("Failed to read systemfile");
+        let mut config: Config =
+            serde_yaml_ng::from_reader(reader).expect("Failed to read systemfile");
 
         println!("Enter path for packages folder: ");
         let mut input = String::new();
@@ -99,10 +105,11 @@ fn setup_check() {
                 eprintln!("{} Error saving systemfile {}", RED_CROSS, e)
             }
         }
-
-
     } else {
-        println!("{} System file does not exists starting fresh...", YELLOW_WARNING);
+        println!(
+            "{} System file does not exists starting fresh...",
+            YELLOW_WARNING
+        );
         println!("Enter path for packages folder: ");
         let mut input = String::new();
         io::stdin()
@@ -126,7 +133,7 @@ fn setup_check() {
         if Path::new(&folder).is_dir() {
             new_config.folder = folder;
             if let Err(e) = save_systemfile(&new_config) {
-                eprintln!("{} Error saving systemfile {}",RED_CROSS, e)
+                eprintln!("{} Error saving systemfile {}", RED_CROSS, e)
             }
         }
     }
@@ -182,10 +189,10 @@ fn chaotic_aur_setup() {
         run_command("pacman-key --recv-key 3056513887B78AEB --keyserver keyserver.ubuntu.com");
         run_command("pacman-key --lsign-key 3056513887B78AEB");
         run_command(
-            "pacman -U --noconfirm 'https://cdn-mirror.chaotic.cx/chaotic-aur/chaotic-keyring.pkg.tar.zst'"
+            "pacman -U --noconfirm 'https://cdn-mirror.chaotic.cx/chaotic-aur/chaotic-keyring.pkg.tar.zst'",
         );
         run_command(
-            "pacman -U --noconfirm 'https://cdn-mirror.chaotic.cx/chaotic-aur/chaotic-mirrorlist.pkg.tar.zst'"
+            "pacman -U --noconfirm 'https://cdn-mirror.chaotic.cx/chaotic-aur/chaotic-mirrorlist.pkg.tar.zst'",
         );
         let mut file = OpenOptions::new()
             .append(true)
@@ -304,9 +311,15 @@ fn install_packages() {
                         }
                     }
                     Err(e) => {
-                        eprintln!("{} Failed to execute command: {} (attempt {})",YELLOW_WARNING, e, attempts);
+                        eprintln!(
+                            "{} Failed to execute command: {} (attempt {})",
+                            YELLOW_WARNING, e, attempts
+                        );
                         if attempts >= max_attempts {
-                            eprintln!("{} Command execution failed after {} attempts",RED_CROSS, max_attempts);
+                            eprintln!(
+                                "{} Command execution failed after {} attempts",
+                                RED_CROSS, max_attempts
+                            );
                             break;
                         }
                     }
@@ -398,6 +411,282 @@ fn manage_package() {
     remove_packages();
 }
 
+fn add_package(packages: &[String]) {
+    if packages.is_empty() {
+        println!("{} No packages provided", YELLOW_WARNING);
+        return;
+    }
+
+    let user = ORIGINAL_USER.get().unwrap();
+
+    let install_command = format!(
+        "sudo -u {} paru -S --needed --noconfirm -- {}",
+        user,
+        packages.join(" ")
+    );
+
+    let result = Command::new("sh")
+        .arg("-c")
+        .arg(&install_command)
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status();
+
+    match result {
+        Ok(status) => {
+            if !status.success() {
+                eprintln!("{} Installation failed: {:?}", RED_CROSS, status.code());
+                return;
+            }
+        }
+        Err(e) => {
+            eprintln!("{} failed to execute paru: {}", RED_CROSS, e);
+            return;
+        }
+    };
+
+    println!("{} Packages installed sucessfully", GREEN_CHECK);
+
+    let file = match File::open(SYSTEM_FILE) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("{} Failed to open systemfile: {}", RED_CROSS, e);
+            return;
+        }
+    };
+
+    let reader = BufReader::new(file);
+    let mut config: Config = match serde_yaml_ng::from_reader(reader) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("{} Failed to parse systemfile: {}", RED_CROSS, e);
+            return;
+        }
+    };
+
+    let manual_install_path = PathBuf::from(&config.folder).join("manual-install.yaml");
+    let mut manual_packages: Vec<String> = if manual_install_path.exists() {
+        match File::open(&manual_install_path) {
+            Ok(file) => {
+                let reader = BufReader::new(file);
+                serde_yaml_ng::from_reader(reader).unwrap_or_else(|_| Vec::new())
+            }
+            Err(_) => Vec::new(),
+        }
+    } else {
+        Vec::new()
+    };
+
+    for package in packages {
+        if !config.packages.contains(package) {
+            config.packages.push(package.clone());
+            manual_packages.push(package.clone());
+        }
+    }
+
+    if let Err(e) = save_systemfile(&config) {
+        eprintln!("{} Failed to save systemfile: {}", RED_CROSS, e);
+        return;
+    }
+
+    match OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&manual_install_path)
+    {
+        Ok(file) => {
+            let writer = BufWriter::new(file);
+            if let Err(e) = serde_yaml_ng::to_writer(writer, &manual_packages) {
+                eprintln!("{} Failed to write manual packages: {}", RED_CROSS, e);
+                return;
+            }
+        }
+        Err(e) => {
+            eprintln!(
+                "{} Failed to create/open manual-install.yaml: {}",
+                RED_CROSS, e
+            );
+            return;
+        }
+    }
+}
+
+fn uninistall_package(packages: &[String]) {
+    if packages.is_empty() {
+        println!("{} No packages provided", YELLOW_WARNING);
+        return;
+    }
+    for (index, package) in packages.iter().enumerate() {
+        println!("  {}. {}", index + 1, package);
+    }
+    println!("\nDo you want to proceed removing above packages [Y/n] : ");
+    let mut confirmation = String::new();
+    io::stdin()
+        .read_line(&mut confirmation)
+        .expect("Failed to read input");
+    let conf = confirmation.trim().to_lowercase();
+
+    if conf != "y" && conf != "" && conf != " " {
+        println!("{} Removal cancelled", YELLOW_WARNING);
+        return;
+    }
+
+    let remove_command = format!("pacman -Rns --noconfirm {}", packages.join(" "));
+
+    let result = Command::new("sh")
+        .arg("-c")
+        .arg(&remove_command)
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status();
+
+    match result {
+        Ok(status) => {
+            if !status.success() {
+                eprintln!(
+                    "{} Uninstallation failed with exit code: {:?}",
+                    YELLOW_WARNING,
+                    status.code()
+                );
+                // Continue even if uninstall fails - package might not be installed
+            }
+        }
+        Err(e) => {
+            eprintln!("{} Failed to execute pacman: {}", RED_CROSS, e);
+            return;
+        }
+    }
+
+    let file = match File::open(SYSTEM_FILE) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("{} Failed to open systemfile: {}", RED_CROSS, e);
+            return;
+        }
+    };
+
+    let reader = BufReader::new(file);
+    let mut config: Config = match serde_yaml_ng::from_reader(reader) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("{} Failed to parse systemfile: {}", RED_CROSS, e);
+            return;
+        }
+    };
+
+    // Remove packages from systemfile
+    config.packages.retain(|pkg| !packages.contains(pkg));
+
+    if let Err(e) = save_systemfile(&config) {
+        eprintln!("{} Failed to save systemfile: {}", RED_CROSS, e);
+        return;
+    }
+
+    let packages_folder = &config.folder;
+
+    match fs::read_dir(packages_folder) {
+        Ok(entries) => {
+            for entry in entries {
+                if let Ok(entry) = entry {
+                    let path = entry.path();
+
+                    // Only process .yaml files
+                    if path.is_file() && path.extension().map_or(false, |ext| ext == "yaml") {
+                        if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
+                            // Read the YAML file
+                            match File::open(&path) {
+                                Ok(file) => {
+                                    let reader = BufReader::new(file);
+                                    let mut file_packages: Vec<String> =
+                                        match serde_yaml_ng::from_reader(reader) {
+                                            Ok(pkgs) => pkgs,
+                                            Err(_) => {
+                                                eprintln!(
+                                                    "{} Failed to parse {}",
+                                                    YELLOW_WARNING, filename
+                                                );
+                                                continue;
+                                            }
+                                        };
+
+                                    let original_len = file_packages.len();
+
+                                    // Remove packages from this file
+                                    file_packages.retain(|pkg| !packages.contains(pkg));
+
+                                    // Only update file if changes were made
+                                    if file_packages.len() != original_len {
+                                        // If file is now empty, delete it
+                                        if file_packages.is_empty() {
+                                            match fs::remove_file(&path) {
+                                                Ok(_) => {
+                                                    println!(
+                                                        "{} Deleted empty file: {}",
+                                                        GREEN_CHECK, filename
+                                                    );
+                                                }
+                                                Err(e) => {
+                                                    eprintln!(
+                                                        "{} Failed to delete {}: {}",
+                                                        RED_CROSS, filename, e
+                                                    );
+                                                }
+                                            }
+                                        } else {
+                                            // File still has packages, write them back
+                                            match OpenOptions::new()
+                                                .write(true)
+                                                .truncate(true)
+                                                .open(&path)
+                                            {
+                                                Ok(file) => {
+                                                    let writer = BufWriter::new(file);
+                                                    if let Err(e) = serde_yaml_ng::to_writer(
+                                                        writer,
+                                                        &file_packages,
+                                                    ) {
+                                                        eprintln!(
+                                                            "{} Failed to write {}: {}",
+                                                            RED_CROSS, filename, e
+                                                        );
+                                                    } else {
+                                                        println!(
+                                                            "{} Updated {}",
+                                                            GREEN_CHECK, filename
+                                                        );
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    eprintln!(
+                                                        "{} Failed to open {} for writing: {}",
+                                                        RED_CROSS, filename, e
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "{} Failed to open {}: {}",
+                                        YELLOW_WARNING, filename, e
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("{} Failed to read packages folder: {}", RED_CROSS, e);
+        }
+    }
+
+    println!("{} Package removal complete", GREEN_CHECK);
+}
+
 fn initialize() {
     setup_check();
     chaotic_aur_setup();
@@ -434,7 +723,10 @@ fn info() {
 }
 
 #[derive(Parser)]
-#[clap(name = "Declarative Arch", about = "Tool to manage archlinux packages declaratively")]
+#[clap(
+    name = "Declarative Arch",
+    about = "Tool to manage archlinux packages declaratively"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -450,13 +742,23 @@ enum Commands {
     Update,
     #[command(name = "info")]
     Info,
+    #[command(name = "add")]
+    Add {
+        /// Package names to add
+        packages: Vec<String>,
+    },
+    #[command(name = "remove")]
+    Remove {
+        /// Package names to remove
+        packages: Vec<String>,
+    },
 }
 
 fn main() {
     match get_original_user() {
         Ok(_user) => {}
         Err(e) => {
-            eprintln!("{} Error: {}",RED_CROSS, e);
+            eprintln!("{} Error: {}", RED_CROSS, e);
             exit(1);
         }
     }
@@ -478,6 +780,14 @@ fn main() {
         Commands::Info => {
             println!("{} Showing info...", BLUE_GEAR);
             info();
+        }
+        Commands::Add { packages } => {
+            println!("{} Adding packages...", BLUE_GEAR);
+            add_package(packages);
+        }
+        Commands::Remove { packages } => {
+            println!("{} Removing packages...", BLUE_GEAR);
+            uninistall_package(packages);
         }
     }
 }

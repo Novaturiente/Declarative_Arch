@@ -9,6 +9,7 @@ serde_yaml_ng = "0.10.0"
 alpm = "4.0.3"
 clap = { version = "4", features = ["derive"] }
 const_format = "0.2"
+rustyline = "17.0.2"
 
 [profile.release]
 opt-level = 'z'     # Optimize for size (like Python's -O flag)
