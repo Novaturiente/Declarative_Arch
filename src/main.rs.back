@@ -27,9 +27,7 @@ const BLUE_GEAR: &str = concatcp!("\x1b[94m", "⚙", RESET);
 const GREEN_CHECK: &str = concatcp!("\x1b[92m", "✓", RESET);
 
 fn get_original_user() -> Result<(), String> {
-    let user = env::var("USER")
-        .or_else(|_| env::var("LOGNAME"))
-        .map_err(|_| "Could not determine current user".to_string())?;
+    let user = env::var("SUDO_USER").map_err(|_| "Program must be run with sudo".to_string())?;
 
     ORIGINAL_USER
         .set(user.clone())
@@ -40,16 +38,10 @@ fn get_original_user() -> Result<(), String> {
     Ok(())
 }
 
-fn run_command(command: &str, needs_sudo: bool) {
-    let final_command = if needs_sudo {
-        format!("sudo {}", command)
-    } else {
-        command.to_string()
-    };
-
+fn run_command(command: &str) {
     let result = Command::new("sh")
         .arg("-c")
-        .arg(&final_command)
+        .arg(command)
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .status();
@@ -77,46 +69,14 @@ struct Config {
 }
 
 fn save_systemfile(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
-    let yaml_content = serde_yaml_ng::to_string(config)?;
-
-    let mut child = Command::new("sudo")
-        .args(&["tee", SYSTEM_FILE])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .spawn()?;
-
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(yaml_content.as_bytes())?;
-    }
-
-    let status = child.wait()?;
-    if !status.success() {
-        return Err("Failed to write system file".into());
-    }
-
+    let file = File::create(SYSTEM_FILE)?;
+    let writer = BufWriter::new(file);
+    serde_yaml_ng::to_writer(writer, config)?;
     Ok(())
 }
 
-fn ensure_system_directory() {
-    let result = Command::new("sudo")
-        .args(&["mkdir", "-p", SYSTEM_DIRECTORY])
-        .status();
-
-    match result {
-        Ok(status) => {
-            if !status.success() {
-                eprintln!("{} Failed to create system directory", RED_CROSS);
-            }
-        }
-        Err(e) => {
-            eprintln!("{} Failed to execute mkdir: {}", RED_CROSS, e);
-        }
-    }
-}
-
 fn setup_check() {
-    ensure_system_directory();
-
+    fs::create_dir_all(SYSTEM_DIRECTORY).expect("Failed to create system directory");
     if Path::new(SYSTEM_FILE).exists() {
         let file = File::open(SYSTEM_FILE).expect("Failed to read systemfile");
         let reader = BufReader::new(file);
@@ -134,7 +94,7 @@ fn setup_check() {
                 format!("/home/{}{}", user, &trimed_input[1..])
             }
             (true, None) => {
-                eprintln!("{} Could not determine user", YELLOW_WARNING);
+                eprintln!("Script is not ran as sudo");
                 trimed_input.to_string()
             }
             (false, _) => trimed_input.to_string(),
@@ -147,7 +107,7 @@ fn setup_check() {
         }
     } else {
         println!(
-            "{} System file does not exist, starting fresh...",
+            "{} System file does not exists starting fresh...",
             YELLOW_WARNING
         );
         println!("Enter path for packages folder: ");
@@ -161,7 +121,7 @@ fn setup_check() {
                 format!("/home/{}{}", user, &trimed_input[1..])
             }
             (true, None) => {
-                eprintln!("{} Could not determine user", YELLOW_WARNING);
+                eprintln!("Script is not ran as sudo");
                 trimed_input.to_string()
             }
             (false, _) => trimed_input.to_string(),
@@ -186,14 +146,13 @@ fn update_system() {
         .expect("Failed to check for reflector");
 
     if !output.status.success() {
-        println!("{} Reflector not installed, installing now", YELLOW_WARNING);
-        run_command("pacman -S --noconfirm reflector", true);
+        println!("{} Reflector not installed installing now", YELLOW_WARNING);
+        run_command("pacman -S --noconfirm reflector");
     }
     run_command(
         "reflector --latest 10 --protocol https --sort rate --save /etc/pacman.d/mirrorlist 2>/dev/null",
-        true,
     );
-    run_command("paru -Syu --noconfirm", false);
+    run_command("paru -Syu --noconfirm");
 }
 
 fn chaotic_aur_setup() {
@@ -204,28 +163,15 @@ fn chaotic_aur_setup() {
             .any(|line| line == "[multilib]"),
         Err(_) => false,
     };
-
     if !multilib_enabled {
-        let multilib_content = "[multilib]\\nInclude = /etc/pacman.d/mirrorlist\\n";
-        let result = Command::new("sudo")
-            .arg("sh")
-            .arg("-c")
-            .arg(format!(
-                "echo -e '{}' >> /etc/pacman.conf",
-                multilib_content
-            ))
-            .status();
+        let mut file = OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open("/etc/pacman.conf")
+            .expect("Failed to open file");
 
-        match result {
-            Ok(status) => {
-                if !status.success() {
-                    eprintln!("{} Failed to add multilib", RED_CROSS);
-                }
-            }
-            Err(e) => {
-                eprintln!("{} Failed to modify pacman.conf: {}", RED_CROSS, e);
-            }
-        }
+        writeln!(file, "[multilib]").expect("Failed to write");
+        writeln!(file, "Include = /etc/pacman.d/mirrorlist").expect("Failed to write");
     }
 
     let chaotic_enabled = match OpenOptions::new().read(true).open("/etc/pacman.conf") {
@@ -235,46 +181,29 @@ fn chaotic_aur_setup() {
             .any(|line| line == "[chaotic-aur]"),
         Err(_) => false,
     };
-
     if !chaotic_enabled {
         println!("Configuring Chaotic-AUR");
-        run_command("pacman -Syu", true);
-        run_command("pacman-key --init", true);
-        run_command("pacman -Sy --noconfirm archlinux-keyring", true);
-        run_command(
-            "pacman-key --recv-key 3056513887B78AEB --keyserver keyserver.ubuntu.com",
-            true,
-        );
-        run_command("pacman-key --lsign-key 3056513887B78AEB", true);
+        run_command("pacman -Syu");
+        run_command("pacman-key --init");
+        run_command("pacman -Sy --noconfirm archlinux-keyring");
+        run_command("pacman-key --recv-key 3056513887B78AEB --keyserver keyserver.ubuntu.com");
+        run_command("pacman-key --lsign-key 3056513887B78AEB");
         run_command(
             "pacman -U --noconfirm 'https://cdn-mirror.chaotic.cx/chaotic-aur/chaotic-keyring.pkg.tar.zst'",
-            true,
         );
         run_command(
             "pacman -U --noconfirm 'https://cdn-mirror.chaotic.cx/chaotic-aur/chaotic-mirrorlist.pkg.tar.zst'",
-            true,
         );
+        let mut file = OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open("/etc/pacman.conf")
+            .expect("Failed to open file");
 
-        let chaotic_content = "[chaotic-aur]\\nInclude = /etc/pacman.d/chaotic-mirrorlist\\n";
-        let result = Command::new("sudo")
-            .arg("sh")
-            .arg("-c")
-            .arg(format!("echo -e '{}' >> /etc/pacman.conf", chaotic_content))
-            .status();
-
-        match result {
-            Ok(status) => {
-                if status.success() {
-                    println!("{} Chaotic-AUR added", GREEN_CHECK);
-                } else {
-                    eprintln!("{} Failed to add chaotic-aur to config", RED_CROSS);
-                }
-            }
-            Err(e) => {
-                eprintln!("{} Failed to modify pacman.conf: {}", RED_CROSS, e);
-            }
-        }
-        run_command("pacman -Syu --noconfirm", true);
+        writeln!(file, "[chaotic-aur]").expect("Failed to write");
+        writeln!(file, "Include = /etc/pacman.d/chaotic-mirrorlist").expect("Failed to write");
+        println!("{} Chaotic-AUR added", GREEN_CHECK);
+        run_command("pacman -Syu --noconfirm");
     }
 }
 
@@ -313,7 +242,8 @@ fn get_system() -> Result<(Vec<String>, Vec<String>, Vec<String>), Box<dyn std::
 fn install_packages() {
     let packages_selected;
     let mut existing_packages;
-    let mut install_command = format!("paru -S --needed --noconfirm -- ");
+    let user = ORIGINAL_USER.get().unwrap();
+    let mut install_command = format!("sudo -u {} paru -S --needed --noconfirm -- ", user);
 
     match get_system() {
         Ok((_packages_installed, selected, existing)) => {
@@ -322,7 +252,7 @@ fn install_packages() {
         }
         Err(e) => {
             eprintln!("{} Error reading packages :: {}", RED_CROSS, e);
-            return;
+            return; // Exit early on error
         }
     }
 
@@ -350,15 +280,12 @@ fn install_packages() {
                     .arg("-c")
                     .arg(&install_command)
                     .stdout(Stdio::inherit())
-                    .stderr(Stdio::piped())  // Capture stderr instead of inheriting
-                    .output();  // Use output() instead of status()
+                    .stderr(Stdio::inherit())
+                    .status();
 
                 match result {
-                    Ok(output) => {
-                        // Convert stderr to string for analysis
-                        let stderr_output = String::from_utf8_lossy(&output.stderr);
-                        
-                        if output.status.success() {
+                    Ok(status) => {
+                        if status.success() {
                             println!("{} All packages installed", GREEN_CHECK);
                             let file = File::open(SYSTEM_FILE).expect("Failed to read systemfile");
                             let reader = BufReader::new(file);
@@ -372,30 +299,14 @@ fn install_packages() {
                             }
                             break;
                         } else {
-                            // Print the stderr to console
-                            eprint!("{}", stderr_output);
-                            
-                            // Check if error is network/download related
-                            if is_network_or_download_error(&stderr_output) {
-                                eprintln!(
-                                    "\n{} Network/Download error detected (attempt {})",
-                                    YELLOW_WARNING, attempts
-                                );
-                                if attempts >= max_attempts {
-                                    eprintln!(
-                                        "{} Installation failed after {} attempts due to network issues",
-                                        RED_CROSS, max_attempts
-                                    );
-                                    std::process::exit(1);
-                                }
-                            } else {
-                                // Non-network error, exit immediately
-                                eprintln!(
-                                    "\n{} Installation failed. Exiting.",
-                                    RED_CROSS
-                                );
-                                eprintln!("Exit code: {:?}", output.status.code());
-                                std::process::exit(1);
+                            eprintln!(
+                                "Command failed with exit code: {:?} (attempt {})",
+                                status.code(),
+                                attempts
+                            );
+                            if attempts >= max_attempts {
+                                eprintln!("Command failed after {} attempts", max_attempts);
+                                break;
                             }
                         }
                     }
@@ -404,9 +315,13 @@ fn install_packages() {
                             "{} Failed to execute command: {} (attempt {})",
                             YELLOW_WARNING, e, attempts
                         );
-                        // Command execution errors are usually system issues, exit
-                        eprintln!("{} Command execution failed. Exiting.", RED_CROSS);
-                        std::process::exit(1);
+                        if attempts >= max_attempts {
+                            eprintln!(
+                                "{} Command execution failed after {} attempts",
+                                RED_CROSS, max_attempts
+                            );
+                            break;
+                        }
                     }
                 }
             }
@@ -416,42 +331,11 @@ fn install_packages() {
     }
 }
 
-// Helper function to detect network/download related errors
-fn is_network_or_download_error(error_output: &str) -> bool {
-    let error_lower = error_output.to_lowercase();
-    
-    // Common network and download error patterns in pacman/paru
-    let network_patterns = [
-        "failed retrieving file",
-        "failed to download",
-        "download failed",
-        "connection timed out",
-        "connection refused",
-        "could not resolve host",
-        "temporary failure in name resolution",
-        "network is unreachable",
-        "curl error",
-        "timeout",
-        "ssl",
-        "tls",
-        "certificate",
-        "failed to retrieve",
-        "error: target not found",  // Sometimes network related
-        "could not connect",
-        "no route to host",
-        "http error 404",
-        "http error 503",
-        "http error 502",
-    ];
-    
-    network_patterns.iter().any(|pattern| error_lower.contains(pattern))
-}
-
 fn remove_packages() {
     let packages_selected;
     let packages_installed;
     let mut existing_packages;
-    let mut remove_command = format!("pacman -Rns --noconfirm ");
+    let mut remove_command = format!("pacman -Rns --noconfirm  ");
 
     match get_system() {
         Ok((installed, selected, existing)) => {
@@ -461,7 +345,7 @@ fn remove_packages() {
         }
         Err(e) => {
             eprintln!("Error reading packages :: {}", e);
-            return;
+            return; // Exit early on error
         }
     }
 
@@ -482,7 +366,7 @@ fn remove_packages() {
 
     if !tobe_removed.is_empty() {
         remove_command.push_str(&tobe_removed.join(" "));
-        println!("Packages to remove :\n{:?}", (&tobe_removed));
+        println!("Packages to install :\n{:?}", (&tobe_removed));
         println!("Do you want to proceed removing above packages [Y/n] : ");
         let mut confirmation = String::new();
         io::stdin()
@@ -490,24 +374,12 @@ fn remove_packages() {
             .expect("Failed to read input");
         let conf = confirmation.trim().to_lowercase();
         if conf == "y" || conf == " " || conf == "" {
-            let result = Command::new("sudo")
-                .arg("sh")
+            let _result = Command::new("sh")
                 .arg("-c")
                 .arg(&remove_command)
                 .stdout(Stdio::inherit())
                 .stderr(Stdio::inherit())
                 .status();
-
-            match result {
-                Ok(status) => {
-                    if !status.success() {
-                        eprintln!("{} Package removal had issues", YELLOW_WARNING);
-                    }
-                }
-                Err(e) => {
-                    eprintln!("{} Failed to execute removal: {}", RED_CROSS, e);
-                }
-            }
         }
 
         existing_packages.retain(|item| !tobe_removed.contains(item));
@@ -529,11 +401,11 @@ fn manage_package() {
     let output = Command::new("pacman")
         .args(&["-Qi", "paru"])
         .output()
-        .expect("Failed to check for paru");
+        .expect("Failed to check for reflector");
 
     if !output.status.success() {
-        println!("{} Paru not installed, installing now", YELLOW_WARNING);
-        run_command("pacman -S --noconfirm paru", true);
+        println!("{} Paru not installed installing now", YELLOW_WARNING);
+        run_command("pacman -S --noconfirm paru");
     }
     install_packages();
     remove_packages();
@@ -545,7 +417,13 @@ fn add_package(packages: &[String]) {
         return;
     }
 
-    let install_command = format!("paru -S --needed -- {}", packages.join(" "));
+    let user = ORIGINAL_USER.get().unwrap();
+
+    let install_command = format!(
+        "sudo -u {} paru -S --needed -- {}",
+        user,
+        packages.join(" ")
+    );
 
     let result = Command::new("sh")
         .arg("-c")
@@ -567,7 +445,7 @@ fn add_package(packages: &[String]) {
         }
     };
 
-    println!("{} Packages installed successfully", GREEN_CHECK);
+    println!("{} Packages installed sucessfully", GREEN_CHECK);
 
     let file = match File::open(SYSTEM_FILE) {
         Ok(f) => f,
@@ -634,7 +512,7 @@ fn add_package(packages: &[String]) {
     }
 }
 
-fn uninstall_package(packages: &[String]) {
+fn uninistall_package(packages: &[String]) {
     if packages.is_empty() {
         println!("{} No packages provided", YELLOW_WARNING);
         return;
@@ -642,8 +520,7 @@ fn uninstall_package(packages: &[String]) {
 
     let remove_command = format!("pacman -Rns {}", packages.join(" "));
 
-    let result = Command::new("sudo")
-        .arg("sh")
+    let result = Command::new("sh")
         .arg("-c")
         .arg(&remove_command)
         .stdout(Stdio::inherit())
@@ -658,6 +535,7 @@ fn uninstall_package(packages: &[String]) {
                     YELLOW_WARNING,
                     status.code()
                 );
+                // Continue even if uninstall fails - package might not be installed
             }
         }
         Err(e) => {
@@ -683,6 +561,7 @@ fn uninstall_package(packages: &[String]) {
         }
     };
 
+    // Remove packages from systemfile
     config.packages.retain(|pkg| !packages.contains(pkg));
 
     if let Err(e) = save_systemfile(&config) {
@@ -698,8 +577,10 @@ fn uninstall_package(packages: &[String]) {
                 if let Ok(entry) = entry {
                     let path = entry.path();
 
+                    // Only process .yaml files
                     if path.is_file() && path.extension().map_or(false, |ext| ext == "yaml") {
                         if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
+                            // Read the YAML file
                             match File::open(&path) {
                                 Ok(file) => {
                                     let reader = BufReader::new(file);
@@ -716,9 +597,13 @@ fn uninstall_package(packages: &[String]) {
                                         };
 
                                     let original_len = file_packages.len();
+
+                                    // Remove packages from this file
                                     file_packages.retain(|pkg| !packages.contains(pkg));
 
+                                    // Only update file if changes were made
                                     if file_packages.len() != original_len {
+                                        // If file is now empty, delete it
                                         if file_packages.is_empty() {
                                             match fs::remove_file(&path) {
                                                 Ok(_) => {
@@ -735,6 +620,7 @@ fn uninstall_package(packages: &[String]) {
                                                 }
                                             }
                                         } else {
+                                            // File still has packages, write them back
                                             match OpenOptions::new()
                                                 .write(true)
                                                 .truncate(true)
@@ -800,22 +686,15 @@ fn update() {
 
     let alpm = Alpm::new("/", "/var/lib/pacman").expect("Failed to read database");
     let db = alpm.localdb();
-    
+
     let orphans: Vec<String> = db
         .pkgs()
         .iter()
-        .filter(|pkg| {
-            pkg.reason() == PackageReason::Depend 
-                && pkg.required_by().is_empty()  // Check hard dependencies
-                && pkg.optional_for().is_empty()  // Check optional dependencies
-        })
+        .filter(|pkg| pkg.reason() == PackageReason::Depend && pkg.required_by().is_empty())
         .map(|pkg| pkg.name().to_string())
         .collect();
-    
     if !orphans.is_empty() {
-        // Use your collected orphans instead of re-querying
-        let orphan_list = orphans.join(" ");
-        run_command(&format!("pacman -Rns {}", orphan_list), true);
+        run_command("pacman -Rns $(pacman -Qdtq)");
     }
 }
 
@@ -894,7 +773,7 @@ fn main() {
         }
         Commands::Remove { packages } => {
             println!("{} Removing packages...", BLUE_GEAR);
-            uninstall_package(packages);
+            uninistall_package(packages);
         }
     }
 }
