@@ -193,6 +193,16 @@ fn update_system() {
         "reflector --latest 10 --protocol https --sort rate --save /etc/pacman.d/mirrorlist 2>/dev/null",
         true,
     );
+
+    let output = Command::new("pacman")
+        .args(&["-Qi", "paru"])
+        .output()
+        .expect("Failed to check for paru");
+
+    if !output.status.success() {
+        println!("{} Paru not installed, installing now", YELLOW_WARNING);
+        run_command("pacman -S --noconfirm paru", true);
+    }
     run_command("paru -Syu --noconfirm", false);
 }
 
@@ -788,6 +798,9 @@ fn uninstall_package(packages: &[String]) {
 }
 
 fn initialize() {
+    run_command("pacman -S --noconfirm rustup", true);
+    run_command("rustup default stable", false);
+    
     setup_check();
     chaotic_aur_setup();
     update_system();
@@ -826,7 +839,7 @@ fn info() {
     let no_of_packages = config.packages.len();
     let folder = config.folder;
     println!("\nPackages folder : {}", folder);
-    println!("No of packages installed : {}", no_of_packages)
+    println!("No of packages installed : {}", no_of_packages);
 }
 
 #[derive(Parser)]
