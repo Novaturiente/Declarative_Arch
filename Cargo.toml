@@ -10,9 +10,10 @@ alpm = "4.0.3"
 clap = { version = "4", features = ["derive"] }
 const_format = "0.2"
 rustyline = "17.0.2"
+rustyline-derive = "0.11.1"
 
 [profile.release]
-opt-level = 'z'     # Optimize for size (like Python's -O flag)
-lto = true          # Link-time optimization
-codegen-units = 1   # Maximum optimization
-strip = true        # Remove debug symbols
+opt-level = 'z'   # Optimize for size (like Python's -O flag)
+lto = true        # Link-time optimization
+codegen-units = 1 # Maximum optimization
+strip = true      # Remove debug symbols

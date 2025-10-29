@@ -12,6 +12,11 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::{Command, Stdio, exit};
 use std::sync::OnceLock;
+use std::thread;
+use std::time::Duration;
+use rustyline::completion::FilenameCompleter;
+use rustyline::Editor;
+
 
 static ORIGINAL_USER: OnceLock<String> = OnceLock::new();
 static USER_DIRECTORY: OnceLock<String> = OnceLock::new();
@@ -20,7 +25,6 @@ const SYSTEM_FILE: &str = "/var/lib/novarch/system.yaml";
 
 // ANSI color codes
 const RESET: &str = "\x1b[0m";
-
 const RED_CROSS: &str = concatcp!("\x1b[91m", "✗", RESET);
 const YELLOW_WARNING: &str = concatcp!("\x1b[93m", "⚠", RESET);
 const BLUE_GEAR: &str = concatcp!("\x1b[94m", "⚙", RESET);
@@ -40,35 +44,135 @@ fn get_original_user() -> Result<(), String> {
     Ok(())
 }
 
-fn run_command(command: &str, needs_sudo: bool) {
+fn ask_confirmation(message: &str) -> bool {
+    print!("{}", message);
+    io::stdout().flush().expect("Failed to flush stdout");
+    
+    let mut confirmation = String::new();
+    io::stdin()
+        .read_line(&mut confirmation)
+        .expect("Failed to read input");
+    
+    let conf = confirmation.trim().to_lowercase();
+    conf == "y" || conf == " " || conf == ""
+}
+
+
+fn is_network_or_download_error(error_output: &str) -> bool {
+    let error_lower = error_output.to_lowercase();
+    
+    let network_patterns = [
+        "failed retrieving file",
+        "failed to download",
+        "download failed",
+        "connection timed out",
+        "connection refused",
+        "could not resolve host",
+        "temporary failure in name resolution",
+        "network is unreachable",
+        "curl error",
+        "timeout",
+        "ssl",
+        "tls",
+        "certificate",
+        "failed to retrieve",
+        "error: target not found",  // Sometimes network related
+        "could not connect",
+        "no route to host",
+        "http error 404",
+        "http error 503",
+        "http error 502",
+    ];
+    
+    network_patterns.iter().any(|pattern| error_lower.contains(pattern))
+}
+
+fn run_command(command: &str, needs_sudo: bool) -> bool {
     let final_command = if needs_sudo {
         format!("sudo {}", command)
     } else {
         command.to_string()
     };
 
-    let result = Command::new("sh")
+    let max_attempts = 3;
+    let mut attempts = 0;
+
+    let out = Command::new("sh")
         .arg("-c")
         .arg(&final_command)
         .stdout(Stdio::inherit())
+        .stdin(Stdio::inherit())
         .stderr(Stdio::inherit())
         .status();
 
-    match result {
+    match out {
         Ok(status) => {
-            if !status.success() {
-                eprintln!(
-                    "{} Command failed with exit code: {:?}",
-                    RED_CROSS,
-                    status.code()
-                );
+            if status.success() {
+                return true;
+            }else {
+                if !ask_confirmation("Error occured do you want to retry [Y/n] : "){
+                    std::process::exit(1);
+                }
             }
         }
         Err(e) => {
-            eprintln!("{} Failed to execute command: {}", RED_CROSS, e);
+            eprintln!("{} Failed to run command {}\n Error:{}", RED_CROSS, final_command, e)
+        }
+    }
+    loop {
+        attempts += 1;
+
+        let result = Command::new("sh")
+            .arg("-c")
+            .arg(&final_command)
+            .stdout(Stdio::inherit())
+            .stdin(Stdio::inherit())
+            .stderr(Stdio::piped())
+            .output();
+
+        match result {
+            Ok(output) => {
+                let stderr_output = String::from_utf8_lossy(&output.stderr);
+                
+                if output.status.success() {
+                    return true;
+                } else {
+                    eprint!("{}", stderr_output);
+                    
+                    if is_network_or_download_error(&stderr_output) {
+                        eprintln!(
+                            "\n{} Network/Download error detected (attempt {})",
+                            YELLOW_WARNING, attempts
+                        );
+                        if attempts >= max_attempts {
+                            eprintln!(
+                                "{} Installation failed after {} attempts due to network issues",
+                                RED_CROSS, max_attempts
+                            );
+                            std::process::exit(1);
+                        } else {
+                            let duration = attempts*5;
+                            thread::sleep(Duration::from_secs(duration));
+                        }
+                    } else {
+                        if attempts >= max_attempts {
+                            std::process::exit(1)
+                        }else {
+                            if !ask_confirmation("Error occured do you want to retry [Y/n] : "){
+                                std::process::exit(1);
+                            }
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("{} Command execution failed: {}\n {}", RED_CROSS, final_command, e);
+                std::process::exit(1);
+            }
         }
     }
 }
+
 
 #[derive(Debug, Deserialize, Serialize)]
 struct Config {
@@ -114,31 +218,61 @@ fn ensure_system_directory() {
     }
 }
 
+fn read_system_file() -> Result<Config, Box<dyn std::error::Error>> {
+    let file = File::open(SYSTEM_FILE)?;
+    let reader = BufReader::new(file);
+    let config: Config = serde_yaml_ng::from_reader(reader)?;
+    Ok( config )
+}
+
+fn load_config() -> Config {
+    read_system_file().unwrap_or_else(|e| {
+        eprintln!("{} Failed to read system file: {}", RED_CROSS, e);
+        exit(1);
+    })  
+}
+
+#[derive(rustyline_derive::Helper, rustyline_derive::Completer, 
+         rustyline_derive::Hinter, rustyline_derive::Validator, 
+         rustyline_derive::Highlighter)]
+struct PathHelper {
+    #[rustyline(Completer)]
+    completer: FilenameCompleter,
+}
+
+fn get_packages_folder() -> String {
+    let helper = PathHelper {
+        completer: FilenameCompleter::new(),
+    };
+    
+    let mut rl = Editor::new().expect("");  // Use default config
+    rl.set_helper(Some(helper));
+    
+    let input = rl.readline("Enter path for packages folder: ").expect("");
+    
+    let folder = if let (true, Some(user)) = (input.trim().starts_with("~"), ORIGINAL_USER.get()) {
+        format!("/home/{}{}", user, &input.trim()[1..])
+    } else {
+        input.trim().to_string()
+    };
+    
+    folder
+}
+
+fn check_package_installed(package: &str) -> bool {
+    Command::new("pacman")
+        .args(&["-Qi", package])
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
 fn setup_check() {
     ensure_system_directory();
 
     if Path::new(SYSTEM_FILE).exists() {
-        let file = File::open(SYSTEM_FILE).expect("Failed to read systemfile");
-        let reader = BufReader::new(file);
-        let mut config: Config =
-            serde_yaml_ng::from_reader(reader).expect("Failed to read systemfile");
-
-        println!("Enter path for packages folder: ");
-        let mut input = String::new();
-        io::stdin()
-            .read_line(&mut input)
-            .expect("Failed to read input");
-        let trimed_input = input.trim();
-        let folder = match (trimed_input.starts_with("~"), ORIGINAL_USER.get()) {
-            (true, Some(user)) => {
-                format!("/home/{}{}", user, &trimed_input[1..])
-            }
-            (true, None) => {
-                eprintln!("{} Could not determine user", YELLOW_WARNING);
-                trimed_input.to_string()
-            }
-            (false, _) => trimed_input.to_string(),
-        };
+        let mut config = load_config();
+        let folder = get_packages_folder();
         if Path::new(&folder).is_dir() {
             config.folder = folder;
             if let Err(e) = save_systemfile(&config) {
@@ -150,22 +284,7 @@ fn setup_check() {
             "{} System file does not exist, starting fresh...",
             YELLOW_WARNING
         );
-        println!("Enter path for packages folder: ");
-        let mut input = String::new();
-        io::stdin()
-            .read_line(&mut input)
-            .expect("Failed to read input");
-        let trimed_input = input.trim();
-        let folder = match (trimed_input.starts_with("~"), ORIGINAL_USER.get()) {
-            (true, Some(user)) => {
-                format!("/home/{}{}", user, &trimed_input[1..])
-            }
-            (true, None) => {
-                eprintln!("{} Could not determine user", YELLOW_WARNING);
-                trimed_input.to_string()
-            }
-            (false, _) => trimed_input.to_string(),
-        };
+        let folder = get_packages_folder();
         let mut new_config = Config {
             folder: String::new(),
             packages: Vec::new(),
@@ -180,26 +299,17 @@ fn setup_check() {
 }
 
 fn update_system() {
-    let output = Command::new("pacman")
-        .args(&["-Qi", "reflector"])
-        .output()
-        .expect("Failed to check for reflector");
-
-    if !output.status.success() {
+    if !check_package_installed("reflector") {
         println!("{} Reflector not installed, installing now", YELLOW_WARNING);
         run_command("pacman -S --noconfirm reflector", true);
     }
+    println!("{} Starting update", BLUE_GEAR);
     run_command(
         "reflector --latest 10 --protocol https --sort rate --save /etc/pacman.d/mirrorlist 2>/dev/null",
         true,
     );
 
-    let output = Command::new("pacman")
-        .args(&["-Qi", "paru"])
-        .output()
-        .expect("Failed to check for paru");
-
-    if !output.status.success() {
+    if !check_package_installed("paru") {
         println!("{} Paru not installed, installing now", YELLOW_WARNING);
         run_command("pacman -S --noconfirm paru", true);
     }
@@ -292,10 +402,8 @@ fn get_system() -> Result<(Vec<String>, Vec<String>, Vec<String>), Box<dyn std::
     let alpm = Alpm::new("/", "/var/lib/pacman").expect("Failed to read Database");
     let db = alpm.localdb();
     let packages_installed: Vec<String> =
-        db.pkgs().iter().map(|pkg| pkg.name().to_string()).collect();
-    let file = File::open(SYSTEM_FILE).expect("Failed to read systemfile");
-    let reader = BufReader::new(file);
-    let config: Config = serde_yaml_ng::from_reader(reader).expect("Failed to read systemfile");
+         db.pkgs().iter().map(|pkg| pkg.name().to_string()).collect();
+    let config = load_config();
     let existing_packages = config.packages;
     let folder = config.folder;
 
@@ -320,6 +428,7 @@ fn get_system() -> Result<(Vec<String>, Vec<String>, Vec<String>), Box<dyn std::
     Ok((packages_installed, all_packages, existing_packages))
 }
 
+
 fn install_packages() {
     let packages_selected;
     let mut existing_packages;
@@ -342,82 +451,19 @@ fn install_packages() {
         .collect();
 
     if !tobe_installed.is_empty() {
-        let max_attempts = 3;
-        let mut attempts = 0;
         install_command.push_str(&tobe_installed.join(" "));
         println!("Packages to install :\n{:?}", (&tobe_installed));
-        println!("Do you want to proceed installing above packages [Y/n] : ");
-        let mut confirmation = String::new();
-        io::stdin()
-            .read_line(&mut confirmation)
-            .expect("Failed to read input");
-        let conf = confirmation.trim().to_lowercase();
-        if conf == "y" || conf == " " || conf == "" {
-            loop {
-                attempts += 1;
-
-                let result = Command::new("sh")
-                    .arg("-c")
-                    .arg(&install_command)
-                    .stdout(Stdio::inherit())
-                    .stderr(Stdio::piped())  // Capture stderr instead of inheriting
-                    .output();  // Use output() instead of status()
-
-                match result {
-                    Ok(output) => {
-                        // Convert stderr to string for analysis
-                        let stderr_output = String::from_utf8_lossy(&output.stderr);
-                        
-                        if output.status.success() {
-                            println!("{} All packages installed", GREEN_CHECK);
-                            let file = File::open(SYSTEM_FILE).expect("Failed to read systemfile");
-                            let reader = BufReader::new(file);
-                            let mut config: Config = serde_yaml_ng::from_reader(reader)
-                                .expect("Failed to read systemfile");
-                            existing_packages.extend(tobe_installed);
-                            config.packages = existing_packages;
-                            match save_systemfile(&config) {
-                                Ok(_) => {}
-                                Err(_) => eprintln!("Failed to save systemfile"),
-                            }
-                            break;
-                        } else {
-                            // Print the stderr to console
-                            eprint!("{}", stderr_output);
-                            
-                            // Check if error is network/download related
-                            if is_network_or_download_error(&stderr_output) {
-                                eprintln!(
-                                    "\n{} Network/Download error detected (attempt {})",
-                                    YELLOW_WARNING, attempts
-                                );
-                                if attempts >= max_attempts {
-                                    eprintln!(
-                                        "{} Installation failed after {} attempts due to network issues",
-                                        RED_CROSS, max_attempts
-                                    );
-                                    std::process::exit(1);
-                                }
-                            } else {
-                                // Non-network error, exit immediately
-                                eprintln!(
-                                    "\n{} Installation failed. Exiting.",
-                                    RED_CROSS
-                                );
-                                eprintln!("Exit code: {:?}", output.status.code());
-                                std::process::exit(1);
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "{} Failed to execute command: {} (attempt {})",
-                            YELLOW_WARNING, e, attempts
-                        );
-                        // Command execution errors are usually system issues, exit
-                        eprintln!("{} Command execution failed. Exiting.", RED_CROSS);
-                        std::process::exit(1);
-                    }
+        let confirmation = ask_confirmation("Do you want to proceed installing above packages [Y/n] : ");
+        if confirmation {
+            let install_status = run_command(&install_command, false);
+            if install_status {
+                println!("{} All packages installed", GREEN_CHECK);
+                let mut config = load_config();
+                existing_packages.extend(tobe_installed);
+                config.packages = existing_packages;
+                match save_systemfile(&config) {
+                    Ok(_) => {}
+                    Err(_) => eprintln!("Failed to save systemfile"),
                 }
             }
         }
@@ -426,36 +472,6 @@ fn install_packages() {
     }
 }
 
-// Helper function to detect network/download related errors
-fn is_network_or_download_error(error_output: &str) -> bool {
-    let error_lower = error_output.to_lowercase();
-    
-    // Common network and download error patterns in pacman/paru
-    let network_patterns = [
-        "failed retrieving file",
-        "failed to download",
-        "download failed",
-        "connection timed out",
-        "connection refused",
-        "could not resolve host",
-        "temporary failure in name resolution",
-        "network is unreachable",
-        "curl error",
-        "timeout",
-        "ssl",
-        "tls",
-        "certificate",
-        "failed to retrieve",
-        "error: target not found",  // Sometimes network related
-        "could not connect",
-        "no route to host",
-        "http error 404",
-        "http error 503",
-        "http error 502",
-    ];
-    
-    network_patterns.iter().any(|pattern| error_lower.contains(pattern))
-}
 
 fn remove_packages() {
     let packages_selected;
@@ -493,60 +509,23 @@ fn remove_packages() {
     if !tobe_removed.is_empty() {
         remove_command.push_str(&tobe_removed.join(" "));
         println!("Packages to remove :\n{:?}", (&tobe_removed));
-        println!("Do you want to proceed removing above packages [Y/n] : ");
-        let mut confirmation = String::new();
-        io::stdin()
-            .read_line(&mut confirmation)
-            .expect("Failed to read input");
-        let conf = confirmation.trim().to_lowercase();
-        if conf == "y" || conf == " " || conf == "" {
-            let result = Command::new("sudo")
-                .arg("sh")
-                .arg("-c")
-                .arg(&remove_command)
-                .stdout(Stdio::inherit())
-                .stderr(Stdio::inherit())
-                .status();
-
-            match result {
-                Ok(status) => {
-                    if !status.success() {
-                        eprintln!("{} Package removal had issues", YELLOW_WARNING);
-                    }
-                }
-                Err(e) => {
-                    eprintln!("{} Failed to execute removal: {}", RED_CROSS, e);
+        let confirmation = ask_confirmation("Do you want to proceed removing above packages [Y/n] : ");
+        if confirmation {
+            let removal_status = run_command(&remove_command, true);
+            if removal_status {
+                existing_packages.retain(|item| !tobe_removed.contains(item));
+                let mut config = load_config();
+                config.packages = existing_packages;
+                match save_systemfile(&config) {
+                    Ok(_) => {}
+                    Err(_) => eprintln!("Failed to save systemfile"),
                 }
             }
         }
 
-        existing_packages.retain(|item| !tobe_removed.contains(item));
-        let file = File::open(SYSTEM_FILE).expect("Failed to read systemfile");
-        let reader = BufReader::new(file);
-        let mut config: Config =
-            serde_yaml_ng::from_reader(reader).expect("Failed to read systemfile");
-        config.packages = existing_packages;
-        match save_systemfile(&config) {
-            Ok(_) => {}
-            Err(_) => eprintln!("Failed to save systemfile"),
-        }
     } else {
         println!("{} No package to remove", GREEN_CHECK);
     }
-}
-
-fn manage_package() {
-    let output = Command::new("pacman")
-        .args(&["-Qi", "paru"])
-        .output()
-        .expect("Failed to check for paru");
-
-    if !output.status.success() {
-        println!("{} Paru not installed, installing now", YELLOW_WARNING);
-        run_command("pacman -S --noconfirm paru", true);
-    }
-    install_packages();
-    remove_packages();
 }
 
 fn add_package(packages: &[String]) {
@@ -557,45 +536,11 @@ fn add_package(packages: &[String]) {
 
     let install_command = format!("paru -S --needed -- {}", packages.join(" "));
 
-    let result = Command::new("sh")
-        .arg("-c")
-        .arg(&install_command)
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status();
-
-    match result {
-        Ok(status) => {
-            if !status.success() {
-                eprintln!("{} Installation failed: {:?}", RED_CROSS, status.code());
-                return;
-            }
-        }
-        Err(e) => {
-            eprintln!("{} failed to execute paru: {}", RED_CROSS, e);
-            return;
-        }
-    };
+    run_command(&install_command, false);
 
     println!("{} Packages installed successfully", GREEN_CHECK);
 
-    let file = match File::open(SYSTEM_FILE) {
-        Ok(f) => f,
-        Err(e) => {
-            eprintln!("{} Failed to open systemfile: {}", RED_CROSS, e);
-            return;
-        }
-    };
-
-    let reader = BufReader::new(file);
-    let mut config: Config = match serde_yaml_ng::from_reader(reader) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("{} Failed to parse systemfile: {}", RED_CROSS, e);
-            return;
-        }
-    };
-
+    let mut config = load_config();
     let manual_install_path = PathBuf::from(&config.folder).join("manual-install.yaml");
     let mut manual_packages: Vec<String> = if manual_install_path.exists() {
         match File::open(&manual_install_path) {
@@ -644,6 +589,59 @@ fn add_package(packages: &[String]) {
     }
 }
 
+fn update_package_files(packages_folder: &str, packages: &[String]) -> Result<(), String> {
+    let entries = fs::read_dir(packages_folder)
+        .map_err(|e| format!("{} Failed to read packages folder: {}", RED_CROSS, e))?;
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        
+        if path.is_file() && path.extension().map_or(false, |ext| ext == "yaml") {
+            process_yaml_file(&path, packages)?;
+        }
+    }
+    
+    Ok(())
+}
+
+fn process_yaml_file(path: &Path, packages: &[String]) -> Result<(), String> {
+    let filename = path.file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| format!("Invalid filename"))?;
+
+    let file = File::open(path)
+        .map_err(|e| format!("{} Failed to open {}: {}", YELLOW_WARNING, filename, e))?;
+    
+    let mut file_packages: Vec<String> = serde_yaml_ng::from_reader(BufReader::new(file))
+        .map_err(|_| format!("{} Failed to parse {}", YELLOW_WARNING, filename))?;
+
+    let original_len = file_packages.len();
+    file_packages.retain(|pkg| !packages.contains(pkg));
+
+    if file_packages.len() == original_len {
+        return Ok(()); // No changes needed
+    }
+
+    if file_packages.is_empty() {
+        fs::remove_file(path)
+            .map_err(|e| format!("{} Failed to delete {}: {}", RED_CROSS, filename, e))?;
+        println!("{} Deleted empty file: {}", GREEN_CHECK, filename);
+    } else {
+        let file = OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(path)
+            .map_err(|e| format!("{} Failed to open {} for writing: {}", RED_CROSS, filename, e))?;
+        
+        serde_yaml_ng::to_writer(BufWriter::new(file), &file_packages)
+            .map_err(|e| format!("{} Failed to write {}: {}", RED_CROSS, filename, e))?;
+        
+        println!("{} Updated {}", GREEN_CHECK, filename);
+    }
+
+    Ok(())
+}
+
 fn uninstall_package(packages: &[String]) {
     if packages.is_empty() {
         println!("{} No packages provided", YELLOW_WARNING);
@@ -652,47 +650,9 @@ fn uninstall_package(packages: &[String]) {
 
     let remove_command = format!("pacman -Rns {}", packages.join(" "));
 
-    let result = Command::new("sudo")
-        .arg("sh")
-        .arg("-c")
-        .arg(&remove_command)
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status();
+    run_command(&remove_command,true);
 
-    match result {
-        Ok(status) => {
-            if !status.success() {
-                eprintln!(
-                    "{} Uninstallation failed with exit code: {:?}",
-                    YELLOW_WARNING,
-                    status.code()
-                );
-            }
-        }
-        Err(e) => {
-            eprintln!("{} Failed to execute pacman: {}", RED_CROSS, e);
-            return;
-        }
-    }
-
-    let file = match File::open(SYSTEM_FILE) {
-        Ok(f) => f,
-        Err(e) => {
-            eprintln!("{} Failed to open systemfile: {}", RED_CROSS, e);
-            return;
-        }
-    };
-
-    let reader = BufReader::new(file);
-    let mut config: Config = match serde_yaml_ng::from_reader(reader) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("{} Failed to parse systemfile: {}", RED_CROSS, e);
-            return;
-        }
-    };
-
+    let mut config = load_config();
     config.packages.retain(|pkg| !packages.contains(pkg));
 
     if let Err(e) = save_systemfile(&config) {
@@ -700,106 +660,26 @@ fn uninstall_package(packages: &[String]) {
         return;
     }
 
-    let packages_folder = &config.folder;
-
-    match fs::read_dir(packages_folder) {
-        Ok(entries) => {
-            for entry in entries {
-                if let Ok(entry) = entry {
-                    let path = entry.path();
-
-                    if path.is_file() && path.extension().map_or(false, |ext| ext == "yaml") {
-                        if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
-                            match File::open(&path) {
-                                Ok(file) => {
-                                    let reader = BufReader::new(file);
-                                    let mut file_packages: Vec<String> =
-                                        match serde_yaml_ng::from_reader(reader) {
-                                            Ok(pkgs) => pkgs,
-                                            Err(_) => {
-                                                eprintln!(
-                                                    "{} Failed to parse {}",
-                                                    YELLOW_WARNING, filename
-                                                );
-                                                continue;
-                                            }
-                                        };
-
-                                    let original_len = file_packages.len();
-                                    file_packages.retain(|pkg| !packages.contains(pkg));
-
-                                    if file_packages.len() != original_len {
-                                        if file_packages.is_empty() {
-                                            match fs::remove_file(&path) {
-                                                Ok(_) => {
-                                                    println!(
-                                                        "{} Deleted empty file: {}",
-                                                        GREEN_CHECK, filename
-                                                    );
-                                                }
-                                                Err(e) => {
-                                                    eprintln!(
-                                                        "{} Failed to delete {}: {}",
-                                                        RED_CROSS, filename, e
-                                                    );
-                                                }
-                                            }
-                                        } else {
-                                            match OpenOptions::new()
-                                                .write(true)
-                                                .truncate(true)
-                                                .open(&path)
-                                            {
-                                                Ok(file) => {
-                                                    let writer = BufWriter::new(file);
-                                                    if let Err(e) = serde_yaml_ng::to_writer(
-                                                        writer,
-                                                        &file_packages,
-                                                    ) {
-                                                        eprintln!(
-                                                            "{} Failed to write {}: {}",
-                                                            RED_CROSS, filename, e
-                                                        );
-                                                    } else {
-                                                        println!(
-                                                            "{} Updated {}",
-                                                            GREEN_CHECK, filename
-                                                        );
-                                                    }
-                                                }
-                                                Err(e) => {
-                                                    eprintln!(
-                                                        "{} Failed to open {} for writing: {}",
-                                                        RED_CROSS, filename, e
-                                                    );
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    eprintln!(
-                                        "{} Failed to open {}: {}",
-                                        YELLOW_WARNING, filename, e
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        Err(e) => {
-            eprintln!("{} Failed to read packages folder: {}", RED_CROSS, e);
-        }
-    }
+    update_package_files(&config.folder, packages).expect("Failed to update reomved packages");
 
     println!("{} Package removal complete", GREEN_CHECK);
 }
 
+fn manage_package() {
+    if !check_package_installed("paru") {
+        println!("{} Paru not installed, installing now", YELLOW_WARNING);
+        run_command("pacman -S --noconfirm paru", true);
+    }
+    install_packages();
+    remove_packages();
+}
+
+
 fn initialize() {
-    run_command("pacman -S --noconfirm rustup", true);
-    run_command("rustup default stable", false);
+    if !check_package_installed("rustup") {
+        run_command("pacman -S --noconfirm rustup", true);
+        run_command("rustup default stable", false);
+    }
     
     setup_check();
     chaotic_aur_setup();
@@ -826,16 +706,13 @@ fn update() {
         .collect();
     
     if !orphans.is_empty() {
-        // Use your collected orphans instead of re-querying
         let orphan_list = orphans.join(" ");
         run_command(&format!("pacman -Rns {}", orphan_list), true);
     }
 }
 
 fn info() {
-    let file = File::open(SYSTEM_FILE).expect("Failed to read systemfile");
-    let reader = BufReader::new(file);
-    let config: Config = serde_yaml_ng::from_reader(reader).expect("Failed to read systemfile");
+    let config = load_config();
     let no_of_packages = config.packages.len();
     let folder = config.folder;
     println!("\nPackages folder : {}", folder);
@@ -864,12 +741,10 @@ enum Commands {
     Info,
     #[command(name = "add")]
     Add {
-        /// Package names to add
         packages: Vec<String>,
     },
     #[command(name = "remove")]
     Remove {
-        /// Package names to remove
         packages: Vec<String>,
     },
 }

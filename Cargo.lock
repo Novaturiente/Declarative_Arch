@@ -272,6 +272,7 @@ dependencies = [
  "clap",
  "const_format",
  "rustyline",
+ "rustyline-derive",
  "serde",
  "serde_yaml_ng",
 ]
@@ -376,6 +377,17 @@ dependencies = [
  "unicode-width",
  "utf8parse",
  "windows-sys 0.60.2",
+]
+
+[[package]]
+name = "rustyline-derive"
+version = "0.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5d66de233f908aebf9cc30ac75ef9103185b4b715c6f2fb7a626aa5e5ede53ab"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]
