@@ -1,3 +1,4 @@
+// Declarative package manager for arch linux
 use alpm::Alpm;
 use alpm::PackageReason;
 use clap::{Parser, Subcommand};
@@ -19,7 +20,6 @@ use rustyline::Editor;
 
 
 static ORIGINAL_USER: OnceLock<String> = OnceLock::new();
-static USER_DIRECTORY: OnceLock<String> = OnceLock::new();
 const SYSTEM_DIRECTORY: &str = "/var/lib/novarch";
 const SYSTEM_FILE: &str = "/var/lib/novarch/system.yaml";
 
@@ -38,9 +38,6 @@ fn get_original_user() -> Result<(), String> {
     ORIGINAL_USER
         .set(user.clone())
         .map_err(|_| "User already set")?;
-    USER_DIRECTORY
-        .set(user)
-        .map_err(|_| "User directory already set")?;
     Ok(())
 }
 
@@ -670,8 +667,8 @@ fn manage_package() {
         println!("{} Paru not installed, installing now", YELLOW_WARNING);
         run_command("pacman -S --noconfirm paru", true);
     }
-    install_packages();
     remove_packages();
+    install_packages();
 }
 
 
